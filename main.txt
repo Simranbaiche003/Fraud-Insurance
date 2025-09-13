@@ -1,0 +1,62 @@
+from fastapi import FastAPI, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+import shutil
+import os
+from utils.pdf_reader import extract_text_from_pdf, extract_text_from_image
+from utils.datasets_loader import load_hospitals, load_diseases
+from utils.fraud_checker import check_fraud
+import re
+import re  # Add this
+
+app = FastAPI()
+
+# Allow frontend connection
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # You can restrict to your frontend URL
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Load datasets
+hospitals_df = load_hospitals()
+diseases_df = load_diseases()
+
+@app.post("/api/claims/upload")
+async def upload_claim(file: UploadFile = File(...)):
+    temp_file_path = f"temp_{file.filename}"
+    with open(temp_file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    # Extract text
+    if file.filename.endswith(".pdf"):
+        text = extract_text_from_pdf(temp_file_path)
+    else:
+        text = extract_text_from_image(temp_file_path)
+
+    os.remove(temp_file_path)
+
+    # Simple regex extraction (adjust according to your PDFs)
+    hospital_match = re.search(r"Hospital[:\- ]+([A-Za-z\s]+)", text)
+    disease_match = re.search(r"Disease[:\- ]+([A-Za-z\s]+)", text)
+    treatment_match = re.search(r"Treatment[:\- ]+([A-Za-z\s]+)", text)
+    amount_match = re.search(r"Amount[:\- ]+([\d,]+)", text)
+
+    claim_data = {
+        "hospital": hospital_match.group(1).strip() if hospital_match else "",
+        "disease": disease_match.group(1).strip() if disease_match else "",
+        "treatment": treatment_match.group(1).strip() if treatment_match else "",
+        "amount": int(amount_match.group(1).replace(",", "")) if amount_match else 0,
+        "patientName": "Unknown",  # Optionally extract
+        "claimId": f"CLM{str(abs(hash(file.filename)) % 10000).zfill(4)}"
+    }
+
+    fraud_status, fraud_reason = check_fraud(claim_data, hospitals_df, diseases_df)
+
+    response = {
+        **claim_data,
+        "fraudStatus": fraud_status,
+        "fraudReason": fraud_reason
+    }
+
+    return response

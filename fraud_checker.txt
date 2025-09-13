@@ -1,0 +1,36 @@
+import re
+
+def check_fraud(claim_data, hospitals_df, diseases_df):
+    """
+    claim_data: dict with keys: hospital, disease, treatment, amount
+    """
+    hospital_name = claim_data.get("hospital", "").strip()
+    disease = claim_data.get("disease", "").strip()
+    treatment = claim_data.get("treatment", "").strip()
+    amount = claim_data.get("amount", 0)
+
+    fraud_status = "clean"
+    fraud_reason = ""
+
+    # Check hospital exists
+    if hospital_name not in hospitals_df['Hospital Name'].values:
+        fraud_status = "fraudulent"
+        fraud_reason = "Hospital not in dataset"
+
+    # Check disease-treatment match
+    disease_row = diseases_df[diseases_df['Disease'].str.lower() == disease.lower()]
+    if not disease_row.empty:
+        valid_treatments = disease_row.iloc[0]['Treatment'].split(", ")
+        if treatment not in valid_treatments:
+            if fraud_status == "clean":
+                fraud_status = "suspicious"
+                fraud_reason = "Treatment mismatch for disease"
+    else:
+        if fraud_status == "clean":
+            fraud_status = "suspicious"
+            fraud_reason = "Disease not in dataset"
+
+    # Optionally, check overbilling (if you have historical average)
+    # For simplicity, skipped for now
+
+    return fraud_status, fraud_reason

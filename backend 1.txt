@@ -1,0 +1,232 @@
+datasets_loader.py
+import pandas as pd
+import os
+
+def load_hospitals():
+    """
+    Loads the hospital dataset and cleans up the column names.
+    """
+    file_path = os.path.join(os.path.dirname(__file__), "../datasets/Hospital_Dataset.xlsx")
+    hospitals_df = pd.read_excel(file_path)
+    # Clean up column names by stripping whitespace
+    hospitals_df.columns = hospitals_df.columns.str.strip()
+    return hospitals_df
+
+def load_diseases():
+    """
+    Loads the disease-treatment dataset and cleans up the column names.
+    """
+    file_path = os.path.join(os.path.dirname(__file__), "../datasets/disease_treatment_dataset.xlsx")
+    diseases_df = pd.read_excel(file_path)
+    # Clean up column names by stripping whitespace
+    diseases_df.columns = diseases_df.columns.str.strip()
+    return diseases_df
+
+def load_claims_history():
+    """
+    Loads the claims history dataset and cleans up the column names.
+    """
+    file_path = os.path.join(os.path.dirname(__file__), "../datasets/Claims_Fraud_Dataset_with_Reasons.xlsx")
+    claims_df = pd.read_excel(file_path)
+    # Clean up column names by stripping whitespace
+    claims_df.columns = claims_df.columns.str.strip()
+    return claims_df
+
+fraud_checker.py
+import re
+
+def check_fraud(claim_data, hospitals_df, diseases_df):
+    """
+    Checks for potential fraud based on hospital, disease, and treatment data.
+    """
+    hospital_name = claim_data.get("hospital", "").strip()
+    disease = claim_data.get("disease", "").strip()
+    treatment = claim_data.get("treatment", "").strip()
+    amount = claim_data.get("amount", 0)
+
+    print("\n--- Checking for Fraud ---")
+    print(f"Hospital Name Extracted: '{hospital_name}'")
+    print(f"Disease Extracted: '{disease}'")
+    print(f"Treatment Extracted: '{treatment}'")
+    print(f"Amount Extracted: {amount}")
+
+    fraud_status = "clean"
+    fraud_reason = ""
+
+    # Check 1: If the hospital is not in the dataset, it's fraudulent
+    if hospital_name not in hospitals_df['HospitalName'].values:
+        fraud_status = "fraudulent"
+        fraud_reason = "Hospital not in dataset"
+        print(f"Fraud Detected: {fraud_reason}")
+        return fraud_status, fraud_reason
+
+    # Check 2: If the disease is not in the dataset, it's fraudulent
+    disease_row = diseases_df[diseases_df['Disease'].str.lower() == disease.lower()]
+    if disease_row.empty:
+        fraud_status = "fraudulent"
+        fraud_reason = "Disease not in dataset"
+        print(f"Fraud Detected: {fraud_reason}")
+        return fraud_status, fraud_reason
+
+    # Check 3: If the treatment is not valid for the disease, it's fraudulent
+    valid_treatments_str = disease_row.iloc[0]['Treatment']
+    valid_treatments = [t.strip().lower() for t in valid_treatments_str.split(',')]
+    
+    if treatment.lower() not in valid_treatments:
+        fraud_status = "fraudulent"
+        fraud_reason = "Treatment mismatch for disease"
+        print(f"Fraud Detected: {fraud_reason}")
+        return fraud_status, fraud_reason
+
+    print("No fraud detected. Claim is clean.")
+    return "clean", "All checks passed."
+
+pdf_reader.py
+import pdfplumber
+from PIL import Image
+import pytesseract
+
+def extract_text_from_pdf(file_path: str) -> str:
+    """
+    Extracts text from a PDF file using pdfplumber.
+    This is much faster and more accurate than OCR for native PDFs.
+    """
+    try:
+        text = ""
+        with pdfplumber.open(file_path) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text + "\n"
+        return text.strip()
+    except Exception as e:
+        print(f"Error extracting text from PDF: {e}")
+        return ""
+
+def extract_text_from_image(file_path: str) -> str:
+    """
+    Extracts text from an image using pytesseract OCR.
+    """
+    try:
+        img = Image.open(file_path)
+        text = pytesseract.image_to_string(img)
+        return text.strip()
+    except Exception as e:
+        print(f"Error extracting text from image: {e}")
+        return ""
+
+
+main.py
+import shutil
+import os
+import re
+import pandas as pd
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from utils.pdf_reader import extract_text_from_pdf, extract_text_from_image
+from utils.datasets_loader import load_hospitals, load_diseases
+from utils.fraud_checker import check_fraud
+
+app = FastAPI()
+
+# Allow frontend connection
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Load datasets
+hospitals_df = load_hospitals()
+diseases_df = load_diseases()
+
+@app.post("/api/claims/upload")
+async def upload_claim(file: UploadFile = File(...)):
+    """
+    Handles file upload, extracts text, and performs a fraud check.
+    """
+    temp_file_path = f"temp_{file.filename}"
+    try:
+        with open(temp_file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        if file.filename.endswith(".pdf"):
+            text = extract_text_from_pdf(temp_file_path)
+        else:
+            text = extract_text_from_image(temp_file_path)
+
+        if not text:
+            raise HTTPException(status_code=400, detail="Failed to extract text from the document.")
+
+        # Updated regex to be more flexible
+        hospital_match = re.search(r"Hospital(?: Name)?:(?:[\s\r\n]+)?(.+)", text, re.IGNORECASE)
+        disease_match = re.search(r"Disease[:\-\s]+(.+)", text, re.IGNORECASE)
+        treatment_match = re.search(r"Treatment[:\-\s]+(.+)", text, re.IGNORECASE)
+        amount_match = re.search(r"Claimed Amount:[\s\r\n]+([₹$\d,\.]+)", text, re.IGNORECASE)
+        patient_name_match = re.search(r"Policy Holder Name:[\s\r\n]+(.+)", text, re.IGNORECASE)
+        claim_id_match = re.search(r"Claim No:[\s\r\n]+([\w\d/]+)", text, re.IGNORECASE)
+        
+        # Initialize variables with empty strings
+        hospital = ""
+        disease = ""
+        treatment = ""
+        amount = 0
+        patient_name = ""
+        claim_id = ""
+
+        # Safely extract data, checking if a match was found
+        if hospital_match:
+            hospital = hospital_match.group(1).strip()
+        
+        if disease_match:
+            disease = disease_match.group(1).strip()
+            
+        if treatment_match:
+            treatment = treatment_match.group(1).strip()
+            
+        if amount_match:
+            amount_str = amount_match.group(1).replace("₹", "").replace("$", "").replace(",", "").strip()
+            try:
+                amount = int(float(amount_str)) # Use float to handle decimals
+            except ValueError:
+                amount = 0
+
+        if patient_name_match:
+            patient_name = patient_name_match.group(1).strip()
+            
+        if claim_id_match:
+            claim_id = claim_id_match.group(1).strip()
+
+        claim_data = {
+            "hospital": hospital,
+            "disease": disease,
+            "treatment": treatment,
+            "amount": amount,
+            "patientName": patient_name,
+            "claimId": claim_id,
+        }
+        
+        print("\n--- Extracted Data for Fraud Check ---")
+        print(claim_data)
+        print("------------------------------------")
+        
+        fraud_status, fraud_reason = check_fraud(claim_data, hospitals_df, diseases_df)
+        
+        claim_data["fraudStatus"] = fraud_status
+        claim_data["fraudReason"] = fraud_reason
+        
+        return {"status": "success", "extractedData": claim_data}
+        
+    except HTTPException as http_exc:
+        raise http_exc
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
+    finally:
+        # Clean up the temporary file
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+
+
+
